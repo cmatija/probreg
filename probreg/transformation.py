@@ -16,14 +16,43 @@ class Transformation():
         pass
 
     def transform(self, points,
-                  array_type=o3.utility.Vector3dVector):
+                  array_type=o3.utility.Vector3dVector, **kwargs):
         if isinstance(points, array_type):
-            return array_type(self._transform(np.asarray(points)))
-        return self._transform(points)
+            return array_type(self._transform(np.asarray(points), **kwargs))
+        return self._transform(points, **kwargs)
 
     @abc.abstractmethod
-    def _transform(self, points):
+    def _transform(self, points, **kwargs):
         return points
+
+
+class MultibodyChainModel(Transformation):
+
+    def __init__(self, n_bodies=1, rot=None, t=None, scale=1.0):
+        super(MultibodyChainModel, self).__init__()
+        self.n_bodies = n_bodies
+        if rot is None:
+            self.rot = [np.eye(3)]*self.n_bodies
+        else:
+            self.rot = rot
+        if t is None:
+            self.t = [np.zeros(3)] * self.n_bodies
+        else:
+            self.t = t
+        self.scale = scale
+
+    def _transform(self, points, **kwargs):
+        ret = np.zeros_like(points)
+        for i, b in enumerate(kwargs.get('bodies', [np.arange(points.shape[0])])):
+            ret[b, ...] = [self.scale * np.dot(points[b, ...], self.rot[i].T).squeeze() + self.t[i]]
+        return ret
+
+    def inverse(self):
+        ret = []
+        for ind in range(self.n_bodies):
+            ret += RigidTransformation(self.rot[ind].T, -np.dot(self.rot[ind].T, self.t[ind]) / self.scale,
+                                       1.0 / self.scale)
+        return ret
 
 
 class RigidTransformation(Transformation):
@@ -40,7 +69,7 @@ class RigidTransformation(Transformation):
         self.t = t
         self.scale = scale
 
-    def _transform(self, points):
+    def _transform(self, points, **kwargs):
         return self.scale * np.dot(points, self.rot.T) + self.t
 
     def inverse(self):
@@ -60,7 +89,7 @@ class AffineTransformation(Transformation):
         self.b = b
         self.t = t
 
-    def _transform(self, points):
+    def _transform(self, points, **kwargs):
         return np.dot(points, self.b.T) + self.t
 
 
@@ -70,7 +99,7 @@ class NonRigidTransformation(Transformation):
         self.g = mu.rbf_kernel(points, points, beta)
         self.w = w
 
-    def _transform(self, points):
+    def _transform(self, points, **kwargs):
         return points + np.dot(self.g, self.w)
 
 
@@ -81,7 +110,7 @@ class CombinedTransformation(Transformation):
         self.rigid_trans = RigidTransformation(rot, t, scale)
         self.v = v
 
-    def _transform(self, points):
+    def _transform(self, points, **kwargs):
         return self.rigid_trans._transform(points + self.v)
 
 
@@ -113,7 +142,7 @@ class TPSTransformation(Transformation):
     def transform_basis(self, basis):
         return np.dot(basis, np.r_[self.a, self.v])
 
-    def _transform(self, points):
+    def _transform(self, points, **kwargs):
         basis, _ = self.prepare(points)
         return self.transform_basis(basis)
 
@@ -161,5 +190,5 @@ class DeformableKinematicModel(Transformation):
         self.dualquats = dualquats
         self.trans = [op.dlb(w[1], [self.dualquats[i] for i in w[0]]) for w in self.weights]
 
-    def _transform(self, points):
+    def _transform(self, points, **kwargs):
         return np.array([t.transform_point(p) for t, p in zip(self.trans, points)])
