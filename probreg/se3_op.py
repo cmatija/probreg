@@ -38,7 +38,9 @@ def twist_trans(tw, linear=False):
             c = np.cos(twd)
             s = np.sin(twd)
             tr = c * np.identity(3) + (1.0 - c) * np.outer(ntw, ntw) + s * skew(ntw)
-            return tr, tw[3:]
+            # tt = (np.eye(3)-tr).dot(skew(ntw)).dot(tw[3:])+np.outer(ntw, ntw).dot(tw[3:])
+            tt = tw[3:]
+            return tr, tt
 
 
 def twist_mul(tw, rot, t, linear=False):
