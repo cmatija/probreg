@@ -9,13 +9,16 @@ from . import transformation as tf
 from . import gaussian_filtering as gf
 from . import gauss_transform as gt
 from . import se3_op as so
+import warnings
 from . import _kabsch as kabsch
 from . import _pt2pl as pt2pl
 from . import math_utils as mu
+import scipy
 try:
     from dq3d import dualquat, quat
 except:
     print("No dq3d python package, filterreg deformation model not available.")
+
 
 EstepResult = namedtuple('EstepResult', ['m0', 'm1', 'm2', 'nx'])
 MstepResult = namedtuple('MstepResult', ['transformation', 'sigma2', 'q'])
@@ -42,7 +45,7 @@ class FilterReg():
             the variance is updated in Mstep.
     """
     def __init__(self, source=None, target_normals=None,
-                 sigma2=None, update_sigma2=False):
+                 sigma2=None, update_sigma2=False, **kwargs):
         self._source = source
         self._target_normals = target_normals
         self._sigma2 = sigma2
@@ -96,22 +99,22 @@ class FilterReg():
         return EstepResult(m0, m1, m2, nx)
 
     def maximization_step(self, t_source, target, estep_res, w=0.0,
-                          objective_type='pt2pt'):
+                          objective_type='pt2pt', **kwargs):
         return self._maximization_step(t_source, target, estep_res,
                                        self._tf_result, self._sigma2, w,
-                                       objective_type=objective_type)
+                                       objective_type=objective_type, **kwargs)
 
     @staticmethod
     @abc.abstractmethod
     def _maximization_step(t_source, target, estep_res, trans_p, sigma2, w=0.0,
-                           objective_type='pt2pt'):
+                           objective_type='pt2pt', **kwargs):
         return None
 
     def registration(self, target, w=0.0,
                      objective_type='pt2pt',
                      maxiter=50, tol=0.001,
                      min_sigma2=1.0e-4,
-                     feature_fn=lambda x: x):
+                     feature_fn=lambda x: x, **kwargs):
         assert not self._tf_type is None, "transformation type is None."
         q = None
         ftarget = feature_fn(target)
@@ -119,11 +122,11 @@ class FilterReg():
             fsource = feature_fn(self._source)
             self._sigma2 = max(mu.squared_kernel_sum(fsource, ftarget), min_sigma2)
         for _ in range(maxiter):
-            t_source = self._tf_result.transform(self._source)
+            t_source = self._tf_result.transform(self._source, **kwargs)
             fsource = feature_fn(t_source)
             estep_res = self.expectation_step(fsource, ftarget, target, self._sigma2, self._update_sigma2,
                                               objective_type)
-            res = self.maximization_step(t_source, target, estep_res, w=w, objective_type=objective_type)
+            res = self.maximization_step(t_source, target, estep_res, w=w, objective_type=objective_type, **kwargs)
             self._tf_result = res.transformation
             self._sigma2 = max(res.sigma2, min_sigma2)
             for c in self._callbacks:
@@ -166,7 +169,7 @@ class RigidFilterReg(FilterReg):
         elif objective_type == 'pt2pl':
             nxm0 = (nx.T / m0).T
             tw, q = pt2pl.compute_twist_for_pt2pl(t_source, m1m0, nxm0, drxdx)
-            rot, t = so.twist_mul(tw, trans_p.rot, trans_p.t)
+            rot, t = so.pt2pl_mul(tw, trans_p.rot, trans_p.t)
         else:
             raise ValueError('Unknown objective_type: %s.' % objective_type)
 
@@ -174,6 +177,69 @@ class RigidFilterReg(FilterReg):
             sigma2 = (m0 * (np.square(t_source).sum(axis=1) - 2.0 * (t_source * m1).sum(axis=1) + m2) / (m0 + c)).sum()
             sigma2 /= (3.0 * m0m0.sum())
         return MstepResult(tf.RigidTransformation(rot, t), sigma2, q)
+
+
+class TwistFilterReg(FilterReg):
+
+    def __init__(self, source=None, target_normals=None,
+                 sigma2=None, update_sigma2=False, tf_init_params=None, bodies=None):
+        super(TwistFilterReg, self).__init__(source=source, target_normals=target_normals,
+                                             sigma2=sigma2, update_sigma2=update_sigma2)
+        if tf_init_params is None:
+            tf_init_params = {}
+
+        self._tf_type = tf.MultibodyChainModel
+        if bodies is None:
+            self.bodies = [np.arange(source.shape[0])]
+        else:
+            self.bodies = bodies
+        tf_init_params['n_bodies'] = len(self.bodies)
+
+        self._tf_result = self._tf_type(**tf_init_params)
+
+    @staticmethod
+    def compute_spatial_velocity_jacobian(source, bodies=None, ind_body=None):
+        if len(bodies) == 1:
+            return np.eye(6)
+        else:
+            a = source
+            raise NotImplemented('computation of the spatial velocity jacobian for the articulated case is not '
+                                 'implemented yet')
+
+    @staticmethod
+    def _maximization_step(t_source, target, estep_res, trans_p, sigma2, w=0.0, bodies=None, objective_type='pt2pt',
+                           max_iter=15, tol=1.0e-4):
+        if bodies is None:
+            bodies = [np.arange(t_source.shape[0])]
+        tol_bodies = tol * len(bodies)
+        m, dim = t_source.shape
+        n = target.shape[0]
+        m0, m1, m2, _ = estep_res
+        c = w / (1.0 - w) * n / m
+        m0[m0 == 0] = np.finfo(np.float32).eps
+        m1m0 = np.divide(m1.T, m0).T
+        m0m0 = m0 / (m0 + c)
+        JtJ_twist = np.zeros((len(bodies), 6, 6))
+        A = np.zeros((6, 6), dtype=np.float128)
+        Jt_error = np.zeros(6, dtype=np.float128)
+
+        for ind_body in range(len(bodies)):
+            for ind_point in bodies[ind_body]:
+                residual = (t_source[ind_point, ...] - m1m0[ind_point, ...])
+                jacobian = so.diff_x_from_twist(t_source[ind_point, ...])
+                JtJ_twist[ind_body] += m0m0[ind_point] * jacobian.T.dot(jacobian)
+                Jt_error -= jacobian.T.dot(residual)
+
+        for ind_body in range(len(bodies)):
+            spatial_jacobian = TwistFilterReg.compute_spatial_velocity_jacobian(t_source, bodies=bodies)
+            A += spatial_jacobian.T.dot(JtJ_twist[ind_body]).dot(spatial_jacobian)
+        sol = scipy.linalg.solve(A, Jt_error, assume_a='sym')
+        matrix = [so.twist_trans(sol[i*6:(i+1)*6], linear=False) for i in range(len(bodies))]
+        qs = np.array([np.sum(np.abs(sol[i*6:i*6+3])) for i in range(len(bodies))])
+        q = np.sum(qs)
+        return MstepResult(tf.MultibodyChainModel(n_bodies=len(bodies),
+                                                  rot=[m[0] for m in matrix],
+                                                  t=[m[1] for m in matrix]), sigma2, q)
 
 
 class DeformableKinematicFilterReg(FilterReg):
@@ -267,7 +333,7 @@ def registration_filterreg(source, target, target_normals=None,
         tf_init_params (dict, optional): Parameters to initialize transformation.
     """
     cv = lambda x: np.asarray(x.points if isinstance(x, o3.geometry.PointCloud) else x)
-    frg = RigidFilterReg(cv(source), cv(target_normals), sigma2, update_sigma2, **kargs)
+    frg = TwistFilterReg(cv(source), cv(target_normals), sigma2, update_sigma2, **kargs)
     frg.set_callbacks(callbacks)
     return frg.registration(cv(target), w=w, objective_type=objective_type, maxiter=maxiter,
-                            tol=tol, min_sigma2=min_sigma2, feature_fn=feature_fn)
+                            tol=tol, min_sigma2=min_sigma2, feature_fn=feature_fn, **kargs)
